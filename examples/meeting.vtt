@@ -1,0 +1,45 @@
+WEBVTT
+
+1
+00:00:01.000 --> 00:00:06.500
+<v Priya>Okay, let's start. Main topic is the webhook retry design and the release on Thursday.
+
+2
+00:00:07.000 --> 00:00:14.000
+<v Charan>The design doc is mostly done. Priya, you asked about idempotency keys, I'll add a section on that.
+
+3
+00:00:14.500 --> 00:00:19.000
+<v Priya>Great. Can you get it to me by Wednesday end of day?
+
+4
+00:00:19.500 --> 00:00:21.000
+<v Charan>Yes, Wednesday works.
+
+5
+00:00:22.000 --> 00:00:31.000
+<v Sam>On the release: the flaky payment retry test is still failing about one in five runs. If we can't fix it we should quarantine it.
+
+6
+00:00:31.500 --> 00:00:40.000
+<v Priya>I'd rather not quarantine payment tests. Let's give it until Wednesday. If it's not fixed, we push the release to Monday.
+
+7
+00:00:40.500 --> 00:00:44.000
+<v Sam>Agreed. I can pair with Charan on it tomorrow morning.
+
+8
+00:00:45.000 --> 00:00:53.000
+<v Marco>Also, staging database credentials: sorry for the delay. I'll send them today.
+
+9
+00:00:54.000 --> 00:01:02.000
+<v Priya>Thanks Marco. Last thing, do we want to use exponential backoff with jitter or a fixed schedule for retries?
+
+10
+00:01:02.500 --> 00:01:08.000
+<v Charan>Exponential with jitter, capped at one hour. I'll put the numbers in the doc.
+
+11
+00:01:08.500 --> 00:01:12.000
+<v Priya>Sounds good. Open question is whether customers can configure it. Let's park that.

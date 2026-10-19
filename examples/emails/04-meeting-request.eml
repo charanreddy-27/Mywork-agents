@@ -1,0 +1,14 @@
+From: Lena Ortiz <lena@partner.example>
+To: Charan <charan@acme.example>
+Date: Mon, 19 Oct 2026 09:30:00 +0200
+Subject: Webhook integration: 30 min this week?
+Content-Type: text/plain; charset="utf-8"
+
+Hi Charan,
+
+We're starting our webhook integration next sprint and have a few questions about retry
+behaviour and signature verification. Would you have 30 minutes on Wednesday or Thursday
+afternoon (CET)?
+
+Best,
+Lena

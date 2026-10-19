@@ -1,0 +1,16 @@
+From: Priya Sharma <priya@acme.example>
+To: Charan <charan@acme.example>
+Date: Mon, 19 Oct 2026 08:12:00 +0530
+Subject: Payment retries failing for EU customers
+Content-Type: text/plain; charset="utf-8"
+
+Hi Charan,
+
+Support has 14 tickets since last night: EU customers' card payments are failing on retry with
+"idempotency key reused". Looks related to Friday's deploy.
+
+Can you take a look this morning and tell me by noon whether we need to roll back? Loop in Sam
+if you need help.
+
+Thanks,
+Priya
