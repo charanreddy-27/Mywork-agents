@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import httpx2
 import pytest
@@ -326,3 +327,184 @@ def test_describe_call() -> None:
     assert describe_call("read_file", {"path": "a.py"}) == "read_file(path='a.py')"
     assert describe_call("x", None) == "x()"
     assert describe_call("y", {"q": "z" * 200}, limit=20).endswith("…")
+
+
+# ------------------------------------------------- security regressions (review)
+
+
+@pytest.fixture
+def local_server(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A real HTTP server on 127.0.0.1 that records every request it receives."""
+    import http.server
+    import threading
+
+    for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    hits: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(f"{self.headers.get('Host')}{self.path}")
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"INTERNAL-SECRET")
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_port, hits
+    server.shutdown()
+
+
+@pytest.mark.parametrize("host", ["2130706433", "0x7f000001", "127.1", "0", "[::ffff:127.0.0.1]"])
+def test_numeric_host_forms_cannot_reach_loopback(local_server: Any, host: str) -> None:
+    port, hits = local_server
+    with pytest.raises(ToolError, match="private or local"):
+        download(f"http://{host}:{port}/admin")
+    assert hits == []
+
+
+def test_connections_use_the_vetted_address(
+    local_server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mywork_agents.tools import web
+
+    port, hits = local_server
+    monkeypatch.setattr(web, "_resolve_public", lambda host, port: "127.0.0.1")
+    assert download(f"http://public.example:{port}/page")[2] == "INTERNAL-SECRET"
+    assert hits == [f"public.example:{port}/page"]  # Host header kept, vetted IP dialled
+
+
+def test_names_resolving_to_private_addresses_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    import socket
+
+    from mywork_agents.tools import web
+
+    fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.7", 80))]
+    monkeypatch.setattr(web.socket, "getaddrinfo", lambda *a, **k: fake)
+    with pytest.raises(ToolError, match="private or local"):
+        web._resolve_public("intranet.example", 80)
+
+
+def test_redirect_hops_are_vetted_before_they_are_requested() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/start":
+            return httpx2.Response(302, headers={"location": "http://127.0.0.1:9/delete"})
+        return httpx2.Response(200, text="public")
+
+    with pytest.raises(ToolError, match="private or local"):
+        download("https://example.com/start", client=_client(httpx2.MockTransport(handler)))
+    assert requested == ["https://example.com/start"]
+
+
+def test_shared_address_space_and_malformed_urls() -> None:
+    for url in ("http://100.100.100.200/latest/meta-data/", "http://[::ffff:100.64.1.1]/"):
+        with pytest.raises(ToolError, match="private or local"):
+            _check_url(url)
+    with pytest.raises(ToolError, match="Not a valid URL"):
+        download("http://[::1/x.ics")
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    with pytest.raises(ToolError, match="Could not fetch"):
+        download("http://256.1.1.1/x", client=_client(transport))
+
+
+def test_user_supplied_urls_may_be_private(local_server: Any) -> None:
+    port, hits = local_server
+    assert download(f"http://127.0.0.1:{port}/cal.ics", allow_private=True)[2] == "INTERNAL-SECRET"
+    assert len(hits) == 1
+
+
+def test_html_tables_missing_head_and_svg_titles() -> None:
+    _, table = html_to_text(
+        "<table><tr><th>Version</th><th>Released</th></tr><tr><td>3.12</td><td>2023</td></tr></table>"
+    )
+    assert "Version | Released" in table
+    assert "3.12 | 2023" in table
+
+    title, text = html_to_text(
+        "<!doctype html><html><head><title>Page</title><body><h1>Install</h1>"
+        "<p>pip install foo <svg><title>Copy</title></svg></p></body></html>"
+    )
+    assert title == "Page"
+    assert "# Install" in text
+    assert "pip install foo" in text
+
+
+def test_secret_files_and_vcs_metadata_are_not_readable(workspace: ToolContext) -> None:
+    root = workspace.workspace
+    (root / ".git").mkdir()
+    (root / ".git" / "config").write_text("extraheader = AUTHORIZATION: basic c2VjcmV0")
+    (root / ".envrc").write_text("export AWS_SECRET_ACCESS_KEY=x")
+    (root / "prod.env").write_text("DB_PASSWORD=x")
+    (root / ".envs" / ".production").mkdir(parents=True)
+    (root / ".envs" / ".production" / ".django").write_text("DJANGO_SECRET_KEY=x")
+
+    for path in (".git/config", ".envrc", "prod.env", ".envs/.production/.django"):
+        text, error = call(read_file, workspace, path=path)
+        assert error, path
+    text, _ = call(search_files, workspace, pattern="SECRET|PASSWORD|AUTHORIZATION")
+    assert text == "No matches."
+    text, error = call(search_files, workspace, pattern="x", path=".git")
+    assert error and "version-control" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks and FIFOs need POSIX")
+def test_symlinks_and_fifos(workspace: ToolContext, tmp_path: Path) -> None:
+    root = workspace.workspace
+    (root / "settings.txt").symlink_to(root / ".env")  # innocent name, secret target
+    text, _ = call(search_files, workspace, pattern="API_KEY=secret")
+    assert text == "No matches."
+
+    outside = tmp_path / "outside-dir"
+    (outside / "deep").mkdir(parents=True)
+    (outside / "deep" / "private_notes.txt").write_text("x")
+    (root / "data").symlink_to(outside)
+    listing, _ = call(list_dir, workspace, depth=4)
+    assert "data/ (link outside the workspace)" in listing
+    assert "private_notes" not in listing
+
+    os.mkfifo(root / "src" / "log.pipe")
+    text, _ = call(search_files, workspace, pattern="TODO")  # must not block on the FIFO
+    assert "src/util.py" in text
+
+
+def test_path_and_brace_globs(workspace: ToolContext) -> None:
+    (workspace.workspace / "src" / "notes.txt").write_text("TODO: txt\n")
+    for glob in ("**/*.py", "src/*.py", "*.{py,js}"):
+        text, _ = call(search_files, workspace, pattern="TODO", glob=glob)
+        assert text == "src/util.py:2: return 'TODO: tidy'", glob
+    text, _ = call(search_files, workspace, pattern="TODO", glob="src/*.{py,txt}")
+    assert text.splitlines() == ["src/notes.txt:1: TODO: txt", "src/util.py:2: return 'TODO: tidy'"]
+
+
+def test_line_numbers_match_git_with_form_feeds(workspace: ToolContext) -> None:
+    (workspace.workspace / "mod.py").write_text("import os\n\x0c\ndef target():\n    pass\n")
+    text, _ = call(search_files, workspace, pattern="def target", path="mod.py")
+    assert text == "mod.py:3: def target():"
+    text, _ = call(read_file, workspace, path="mod.py")
+    assert "3 | def target():" in text
+
+
+def test_git_show_cannot_read_blobs_or_leak_secrets(repo: Path) -> None:
+    (repo / ".env").write_text("STRIPE=sk_live_SECRET\n")
+    git(repo, "add", ".env")
+    git(repo, "commit", "-qm", "chore: add env")
+    ctx = ToolContext(workspace=repo, settings=Settings())
+
+    text, error = call(git_show, ctx, rev="HEAD:.env")
+    assert error and "Not a valid git revision" in text
+    text, error = call(git_show, ctx, rev="HEAD")
+    assert not error
+    assert "sk_live" not in text
+
+    (repo / ".env").write_text("STRIPE=sk_live_NEW\n")
+    (repo / "calc.py").write_text("def add(a, b):\n    return b + a\n")
+    uncommitted = gitmod.diff(repo)
+    assert "calc.py" in uncommitted
+    assert "sk_live" not in uncommitted

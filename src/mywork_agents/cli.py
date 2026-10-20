@@ -235,7 +235,8 @@ def _read_calendar(source: str) -> str:
             else source
         )
         try:
-            return download(url, max_bytes=MAX_CALENDAR_BYTES)[2]
+            # The user typed this URL, so self-hosted calendars on the LAN are fine.
+            return download(url, max_bytes=MAX_CALENDAR_BYTES, allow_private=True)[2]
         except MyworkError as exc:
             raise InputError(f"Could not download the calendar: {exc}") from exc
     return _read_text(source, what="calendar")

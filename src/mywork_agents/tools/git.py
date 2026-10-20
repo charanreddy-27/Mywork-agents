@@ -11,10 +11,19 @@ from pydantic import BaseModel, Field
 
 from mywork_agents.core.tools import ToolContext, tool
 from mywork_agents.errors import InputError, ToolError
+from mywork_agents.tools.files import SENSITIVE_DIR_PATTERNS, SENSITIVE_PATTERNS
 
 GIT_TIMEOUT_S = 30
-# Revisions and paths coming from the model must never be parsed as options.
-_SAFE_REV = re.compile(r"^[A-Za-z0-9._/~^@{}:+-]+$")
+# Revisions coming from the model must never be parsed as options, and may not use the
+# `rev:path` form, which would print a file's contents and bypass the secret filter.
+_SAFE_REV = re.compile(r"^[A-Za-z0-9._/~^@{}+-]+$")
+
+
+def secret_excludes() -> list[str]:
+    """Pathspecs that keep likely-secret files out of diffs and patches sent to Claude."""
+    files = [f":(exclude,glob,icase)**/{pattern}" for pattern in SENSITIVE_PATTERNS]
+    dirs = [f":(exclude,glob,icase)**/{pattern}/**" for pattern in SENSITIVE_DIR_PATTERNS]
+    return files + dirs
 
 
 class GitError(InputError):
@@ -91,8 +100,7 @@ def diff(
         args.append("--cached")
     else:
         args.append("HEAD")
-    if paths:
-        args += ["--", *paths]
+    args += ["--", *(paths or ["."]), *secret_excludes()]
     return run_git(repo, *args)
 
 
@@ -183,7 +191,8 @@ def git_show(ctx: ToolContext, args: GitShowArgs) -> str:
     """
     rev = check_rev(args.rev)
     flags = ["--stat"] if args.stat_only else ["--stat", "--patch"]
-    return run_git(ctx.workspace, "show", "--no-color", *flags, rev, "--")
+    # "." limits the output to the workspace; secret files are left out of patches.
+    return run_git(ctx.workspace, "show", "--no-color", *flags, rev, "--", ".", *secret_excludes())
 
 
 GIT_TOOLS = (git_log, git_show)

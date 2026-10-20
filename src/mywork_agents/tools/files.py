@@ -5,6 +5,8 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import stat
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -39,10 +41,13 @@ IGNORED_DIRS = frozenset(
     }
 )
 
+# Version-control internals: .git/config can hold tokens (e.g. actions/checkout's header).
+VCS_DIRS = frozenset({".git", ".hg", ".svn"})
+
 # Never send these to the API: they usually hold credentials.
 SENSITIVE_PATTERNS = (
-    ".env",
-    ".env.*",
+    ".env*",
+    "*.env",
     "*.pem",
     "*.key",
     "*.p12",
@@ -60,15 +65,29 @@ SENSITIVE_PATTERNS = (
     "secrets.*",
 )
 SENSITIVE_ALLOWED = ("*.example", "*.sample", "*.template")
+# Directories whose contents are secrets too, e.g. cookiecutter-django's .envs/.production/.
+SENSITIVE_DIR_PATTERNS = (".env*",)
 
 MAX_FILE_BYTES = 2_000_000
 
 
-def is_sensitive(path: Path) -> bool:
+def is_sensitive(path: Path, root: Path | None = None) -> bool:
+    """True for files that commonly hold credentials (by name, or by a parent directory)."""
     name = path.name.lower()
-    if any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_ALLOWED):
+    allowed = any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_ALLOWED)
+    if not allowed and any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_PATTERNS):
+        return True
+    if root is None:
         return False
-    return any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_PATTERNS)
+    try:
+        parents = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    return any(
+        fnmatch.fnmatch(part.lower(), pattern)
+        for part in parents
+        for pattern in SENSITIVE_DIR_PATTERNS
+    )
 
 
 def resolve_in_workspace(ctx: ToolContext, raw: str) -> Path:
@@ -79,7 +98,17 @@ def resolve_in_workspace(ctx: ToolContext, raw: str) -> Path:
         raise ToolError(
             f"{raw!r} is outside the workspace ({root}); only files inside it are readable."
         )
+    if VCS_DIRS.intersection(target.relative_to(root).parts):
+        raise ToolError(f"{raw!r} is inside version-control metadata, which is not readable.")
     return target
+
+
+def split_lines(text: str) -> list[str]:
+    """Split on newlines only, so numbers match git and grep (unlike str.splitlines)."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _display(ctx: ToolContext, path: Path) -> str:
@@ -109,13 +138,15 @@ def read_file(ctx: ToolContext, args: ReadFileArgs) -> str:
     path = resolve_in_workspace(ctx, args.path)
     if not path.is_file():
         raise ToolError(f"No such file: {args.path}")
-    if is_sensitive(path):
+    root = ctx.workspace.resolve()
+    # Check both the name asked for and the file it resolves to (symlinks).
+    if is_sensitive(root / args.path, root) or is_sensitive(path, root):
         raise ToolError(f"{args.path} looks like it holds secrets, so it is not readable.")
     if path.stat().st_size > MAX_FILE_BYTES:
         raise ToolError(f"{args.path} is larger than 2 MB; search it with search_files instead.")
     if is_probably_binary(path):
         raise ToolError(f"{args.path} is a binary file.")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = split_lines(path.read_text(encoding="utf-8", errors="replace"))
     total = len(lines)
     start = args.offset - 1
     chunk = lines[start : start + args.limit]
@@ -144,6 +175,7 @@ def list_dir(ctx: ToolContext, args: ListDirArgs) -> str:
         raise ToolError(f"No such directory: {args.path}")
     lines: list[str] = [f"{_display(ctx, root)}/"]
     limit = 500
+    workspace_root = ctx.workspace.resolve()
 
     def walk(directory: Path, level: int) -> None:
         try:
@@ -155,6 +187,9 @@ def list_dir(ctx: ToolContext, args: ListDirArgs) -> str:
                 return
             if child.is_dir():
                 if child.name in IGNORED_DIRS:
+                    continue
+                if child.is_symlink() and not child.resolve().is_relative_to(workspace_root):
+                    lines.append(f"{'  ' * level}{child.name}/ (link outside the workspace)")
                     continue
                 lines.append(f"{'  ' * level}{child.name}/")
                 if level < args.depth:
@@ -172,7 +207,8 @@ class SearchFilesArgs(BaseModel):
     pattern: str = Field(description="Regular expression (Python syntax) to search for.")
     path: str = Field(default=".", description="Directory or file to search, relative to the root.")
     glob: str | None = Field(
-        default=None, description="Only search files matching this glob, e.g. '*.py'."
+        default=None,
+        description="Only search matching files, e.g. '*.py', 'src/**/*.ts' or '*.{js,ts}'.",
     )
     ignore_case: bool = Field(default=False, description="Case-insensitive match.")
     max_results: int = Field(default=80, ge=1, le=500, description="Stop after this many matches.")
@@ -193,6 +229,8 @@ def search_files(ctx: ToolContext, args: SearchFilesArgs) -> str:
     if not base.exists():
         raise ToolError(f"No such path: {args.path}")
 
+    root = ctx.workspace.resolve()
+    wanted = _glob_matcher(args.glob) if args.glob else None
     files: list[Path] = []
     if base.is_file():
         files = [base]
@@ -200,28 +238,71 @@ def search_files(ctx: ToolContext, args: SearchFilesArgs) -> str:
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
             for filename in sorted(filenames):
-                if args.glob and not fnmatch.fnmatch(filename, args.glob):
+                candidate = Path(dirpath) / filename
+                if wanted and not wanted(filename, candidate.relative_to(root).as_posix()):
                     continue
-                files.append(Path(dirpath) / filename)
+                files.append(candidate)
 
-    root = ctx.workspace.resolve()
     matches: list[str] = []
     for file in files:
-        if is_sensitive(file) or not file.resolve().is_relative_to(root):
-            continue  # skip secrets and symlinks that point outside the workspace
+        resolved = file.resolve()
+        if (
+            not resolved.is_relative_to(root)
+            or is_sensitive(file, root)
+            or is_sensitive(resolved, root)
+        ):
+            continue  # secrets (by link name or target) and links out of the workspace
         try:
-            if file.stat().st_size > MAX_FILE_BYTES or is_probably_binary(file):
+            info = file.stat()
+            # Regular files only: reading a named pipe would block forever.
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+                continue
+            if is_probably_binary(file):
                 continue
             text = file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for number, line in enumerate(text.splitlines(), 1):
+        for number, line in enumerate(split_lines(text), 1):
             if regex.search(line):
                 matches.append(f"{_display(ctx, file)}:{number}: {line.strip()[:200]}")
                 if len(matches) >= args.max_results:
                     matches.append(f"[stopped after {args.max_results} matches]")
                     return "\n".join(matches)
     return "\n".join(matches) if matches else "No matches."
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    match = re.search(r"\{([^{}]*)\}", pattern)
+    if match is None:
+        return [pattern]
+    head, tail = pattern[: match.start()], pattern[match.end() :]
+    return [
+        expanded
+        for option in match.group(1).split(",")
+        for expanded in _expand_braces(head + option + tail)
+    ]
+
+
+def _glob_matcher(glob: str) -> Callable[[str, str], bool]:
+    """Match a file by name ('*.py') or, for globs with '/', by workspace-relative path."""
+    name_patterns: list[str] = []
+    path_patterns: list[str] = []
+    for pattern in _expand_braces(glob.strip()):
+        if "/" not in pattern:
+            name_patterns.append(pattern)
+            continue
+        path_patterns.append(pattern)
+        shorter = pattern
+        while shorter.startswith("**/"):  # '**/' may also match zero directories
+            shorter = shorter[3:]
+            path_patterns.append(shorter)
+
+    def matches(name: str, relative_path: str) -> bool:
+        return any(fnmatch.fnmatch(name, p) for p in name_patterns) or any(
+            fnmatch.fnmatch(relative_path, p) for p in path_patterns
+        )
+
+    return matches
 
 
 FILE_TOOLS = (list_dir, read_file, search_files)
