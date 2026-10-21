@@ -44,6 +44,9 @@ class Usage:
     cache_read_input_tokens: int = 0
     web_search_requests: int = 0
     requests: int = 0
+    # Estimated per request (price tiers depend on each request's prompt size).
+    cost_usd: float = 0.0
+    unpriced_requests: int = 0
 
     def add(self, other: Usage) -> None:
         self.input_tokens += other.input_tokens
@@ -52,13 +55,22 @@ class Usage:
         self.cache_read_input_tokens += other.cache_read_input_tokens
         self.web_search_requests += other.web_search_requests
         self.requests += other.requests
+        self.cost_usd += other.cost_usd
+        self.unpriced_requests += other.unpriced_requests
+
+    @property
+    def estimated_cost(self) -> float | None:
+        """Estimated USD cost, or None if a request used a model without known prices."""
+        return None if self.unpriced_requests else self.cost_usd
 
     @property
     def total_input_tokens(self) -> int:
         return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, int | float | None]:
+        cost = self.estimated_cost
         return {
+            "estimated_cost_usd": round(cost, 6) if cost is not None else None,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
@@ -181,6 +193,8 @@ class AnthropicLLM:
                 for _event in stream:
                     pass
                 message = stream.get_final_message()
+        except UnicodeError:
+            raise  # the request itself could not be encoded; retrying will not help
         except ValueError as exc:
             # The SDK raises ValueError (and only that) for tool-input JSON it cannot
             # parse at all. API errors are not ValueErrors and propagate untouched.
@@ -254,6 +268,11 @@ def convert_message(message: Any) -> LLMResponse:
             server_calls.append(
                 ToolCall(_attr(block, "id"), _attr(block, "name"), _attr(block, "input"))
             )
+        elif kind == "web_fetch_tool_result":
+            fetched = _attr(block, "content")
+            if _attr(fetched, "type") == "web_fetch_result" and _attr(fetched, "url"):
+                document = _attr(fetched, "content")
+                results.append(Source(_attr(fetched, "url"), _attr(document, "title")))
         elif kind == "web_search_tool_result":
             found = _attr(block, "content")
             # A successful search returns a list; an error returns a single object.

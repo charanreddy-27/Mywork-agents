@@ -104,6 +104,13 @@ def diff(
     return run_git(repo, *args)
 
 
+def untracked_files(repo: Path, paths: list[str] | None = None) -> list[str]:
+    """New files git does not track yet (they never appear in a diff)."""
+    args = ["ls-files", "--others", "--exclude-standard", "--", *(paths or ["."])]
+    args += secret_excludes()
+    return [line for line in run_git(repo, *args, check=False).splitlines() if line.strip()]
+
+
 def commit(repo: Path, message: str) -> str:
     """Create a commit from the staged changes; git hooks run as usual."""
     if not git_available():

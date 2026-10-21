@@ -27,3 +27,12 @@ First release.
 - `--json`, `--output`, `--dry-run` on every agent command; `review --fail-on` for CI.
 - Plugin agents through the `mywork_agents.agents` entry point group and `FakeLLM` for offline
   tests.
+
+### Security
+
+- Before release, an independent multi-agent review reproduced and verified every finding. Fixed:
+  SSRF bypasses in `fetch_url` (numeric hosts, internal DNS names, redirects, 100.64/10), secret
+  exposure through `.git/config`, `.env*` variants, symlinks and `git show rev:path`, and secrets in
+  review diffs. The same review also covered calendar recurrences and time zones, email and
+  transcript parsing, CLI precedence and output safety, history clean-up, commit message wrapping
+  and the docs.

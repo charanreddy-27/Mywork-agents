@@ -63,6 +63,10 @@ class Tool:
         return spec
 
     def invoke(self, ctx: ToolContext, raw_input: Any) -> ToolOutcome:
+        outcome = self._invoke(ctx, raw_input)
+        return ToolOutcome(valid_utf8(outcome.content), outcome.is_error)
+
+    def _invoke(self, ctx: ToolContext, raw_input: Any) -> ToolOutcome:
         try:
             args = self.args_model.model_validate(raw_input)
         except ValidationError as exc:
@@ -79,6 +83,21 @@ class Tool:
         except Exception as exc:  # a broken tool should not kill the whole run
             return ToolOutcome(f"{type(exc).__name__}: {exc}", is_error=True)
         return ToolOutcome(truncate_output(result))
+
+
+def valid_utf8(text: str) -> str:
+    """Replace lone surrogates (e.g. from undecodable file names) so the request can be sent."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # U+DC80..U+DCFF are escaped bytes (os.fsdecode): turn them back into bytes so the
+        # decoder can recover what it can; any other lone surrogate becomes U+FFFD.
+        cleaned = "".join(
+            "\ufffd" if "\ud800" <= char <= "\udc7f" or "\udd00" <= char <= "\udfff" else char
+            for char in text
+        )
+        return cleaned.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return text
 
 
 def truncate_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:

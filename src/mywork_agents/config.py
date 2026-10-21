@@ -142,6 +142,7 @@ def user_config_path() -> Path:
 def config_files(cwd: Path, explicit: Path | None = None) -> list[Path]:
     """Config files that apply, lowest precedence first."""
     if explicit is not None:
+        explicit = explicit.expanduser()
         if not explicit.is_file():
             raise ConfigError(f"Config file not found: {explicit}")
         return [explicit]
@@ -154,6 +155,7 @@ def config_files(cwd: Path, explicit: Path | None = None) -> list[Path]:
     return [p for p in (user_config_path(), cwd / PROJECT_CONFIG_NAME) if p.is_file()]
 
 
+_PER_AGENT_KEYS = ("model", "effort", "max_tokens", "max_turns")
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
@@ -213,7 +215,15 @@ def load_settings(
     for path in config_files(cwd, config_file):
         data = _deep_merge(data, _read_toml(path))
         sources.append(str(path))
-    data = _deep_merge(data, _env_overrides())
+    env = _env_overrides()
+    # Env vars outrank every config file, including per-agent sections in them.
+    per_agent = {k: env[k] for k in _PER_AGENT_KEYS if k in env}
+    if per_agent and isinstance(data.get("agents"), dict):
+        data["agents"] = {
+            name: {**section, **per_agent} if isinstance(section, dict) else section
+            for name, section in data["agents"].items()
+        }
+    data = _deep_merge(data, env)
     data = _deep_merge(data, {k: v for k, v in (overrides or {}).items() if v is not None})
     try:
         return Settings.model_validate(data)
@@ -261,3 +271,24 @@ working_hours = "09:00-17:30"
 # model = "claude-haiku-5-5"
 # instructions = "Keep each bullet under 15 words."
 """
+
+
+def project_template() -> str:
+    """CONFIG_TEMPLATE with every setting commented out.
+
+    A project file outranks the user's own config, so it must not silently reset
+    their choices to the defaults; it only documents what can be set.
+    """
+    lines = []
+    for line in CONFIG_TEMPLATE.splitlines():
+        stripped = line.lstrip()
+        is_setting = stripped and not stripped.startswith(("#", "[")) and "=" in stripped
+        lines.append(f"# {line}" if is_setting else line)
+    return (
+        "\n".join(lines).replace(
+            "# mywork-agents configuration",
+            "# mywork-agents project configuration: uncomment what this project should override",
+            1,
+        )
+        + "\n"
+    )

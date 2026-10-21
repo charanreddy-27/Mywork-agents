@@ -15,7 +15,8 @@ from mywork_agents.tools.web import fetch_url, supports_server_fetch, web_server
 
 Depth = Literal["quick", "standard", "deep"]
 
-_DEPTH: dict[Depth, tuple[Effort, int]] = {
+# depth -> (effort, maximum web searches/fetches)
+DEPTHS: dict[Depth, tuple[Effort, int]] = {
     "quick": ("low", 3),
     "standard": ("medium", 6),
     "deep": ("high", 15),
@@ -66,14 +67,15 @@ class ResearchAgent(Agent[ResearchReport]):
         self.depth = depth
         self.search = search
         self.question = ""
+        self.urls: list[str] = []
 
     def effort_override(self) -> Effort:
-        return _DEPTH[self.depth][0]
+        return DEPTHS[self.depth][0]
 
     def server_tools(self, model: str) -> list[dict[str, Any]]:
         if not self.search:
             return []
-        return web_server_tools(model, max_uses=_DEPTH[self.depth][1])
+        return web_server_tools(model, max_uses=DEPTHS[self.depth][1])
 
     def active_tools(self, model: str) -> tuple[Tool, ...]:
         # Use Anthropic's web_fetch when it is available; otherwise fetch pages locally.
@@ -83,7 +85,9 @@ class ResearchAgent(Agent[ResearchReport]):
 
     def build_task(self, question: str, *, urls: list[str] | None = None) -> str:
         self.question = question.strip()
-        parts = [f"<question>\n{self.question}\n</question>"]
+        self.urls = list(urls or [])
+        # The question is the user's request, so it is not wrapped in a data tag.
+        parts = [f"Research question: {self.question}"]
         if urls:
             listed = "\n".join(f"- {u}" for u in urls)
             parts.append(f"Start by reading these pages:\n{listed}")
@@ -95,11 +99,11 @@ class ResearchAgent(Agent[ResearchReport]):
         return self.build_task(text)
 
     def finalize(self, response: LLMResponse, sources: list[Source]) -> ResearchReport:
-        return ResearchReport(
-            question=self.question,
-            report=response.text.strip(),
-            sources=[SourceRef(url=s.url, title=s.title) for s in sources],
-        )
+        # Without citations (e.g. a summary of one page), list the pages the user gave.
+        refs = [SourceRef(url=s.url, title=s.title) for s in sources]
+        known = {ref.url for ref in refs}
+        refs += [SourceRef(url=url) for url in self.urls if url not in known]
+        return ResearchReport(question=self.question, report=response.text.strip(), sources=refs)
 
     def render(self, output: ResearchReport) -> str:
         sources = "\n".join(

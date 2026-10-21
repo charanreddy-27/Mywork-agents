@@ -43,7 +43,7 @@ $ mywork research "Postgres vs. SQLite for a desktop app in 2026"
 | `mywork inbox` | Priority + category for every email, action items, deadlines, reply drafts, phishing flags | `.eml`, `.mbox`, text, or a folder |
 | `mywork meeting` | Summary, decisions, owned action items, open questions and a follow-up email | transcript (`.vtt`, `.srt`, `.txt`) |
 | `mywork research` | A cited brief: TL;DR, key findings, caveats, sources | any question, optional URLs |
-| `mywork review` | Verified findings with severity, location and fix, plus a verdict | uncommitted changes, `--base main`, or a patch |
+| `mywork review` | Verified findings with severity, location and fix, plus a verdict | uncommitted changes to tracked files, `--base main`, or a patch |
 | `mywork commit` | A conventional commit message that matches your repo's style (`--apply` commits it) | staged changes |
 | `mywork readme` | A README written from what's actually in the project | a project directory |
 
@@ -61,8 +61,11 @@ pipx install git+https://github.com/charanreddy-27/Mywork-agents
 # Authenticate (or run `ant auth login`)
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# Check your setup, then try the bundled examples
+# Check your setup
 mywork doctor --ping
+
+# Try the bundled examples (they live in the repository, not in the installed package)
+git clone https://github.com/charanreddy-27/Mywork-agents && cd Mywork-agents
 mywork meeting examples/meeting.vtt
 mywork inbox examples/emails
 mywork plan --tasks examples/tasks.md --notes examples/notes.md --calendar examples/calendar.ics
@@ -114,15 +117,17 @@ mywork research "..." --depth deep -o brief.md
 ```
 
 Research uses Anthropic's server-side web search and fetch tools and appends the sources Claude
-cited. `--no-search` answers from the model's knowledge (still reading any `--url` pages).
+cited (plus any `--url` pages). `--depth` sets how hard it digs (effort and number of searches) and
+beats a configured effort; `--effort` beats both. `--no-search` answers from the model's knowledge
+(still reading any `--url` pages).
 
 ### Review, commit, document
 
 ```bash
-mywork review                                 # all uncommitted changes
+mywork review                                 # all uncommitted changes to tracked files
 mywork review --staged
 mywork review --base main --focus "security, error handling"
-mywork review src/payments                    # only part of the diff
+mywork review src/payments                    # only part of the diff (relative to where you are)
 git diff main | mywork review --diff -
 
 git add -p && mywork commit --apply           # review the message, then commit
@@ -132,6 +137,10 @@ mywork readme . --write                       # creates or refreshes README.md
 ```
 
 ### Use it in CI
+
+New files that are not yet tracked by git don't appear in a diff; `review` lists them as a
+warning (`git add -N <file>` includes them). Files that look like secrets (`.env*`, keys, ...) are
+always left out of the diffs sent to Claude.
 
 `mywork review` exits with code 1 when `--fail-on` finds an issue at or above that severity:
 
@@ -185,7 +194,8 @@ history off with `history = false` in config or `MYWORK_HISTORY=0`.
 ## Configuration
 
 `mywork config init` writes a commented config file to `~/.config/mywork/config.toml`
-(`--project` writes `./mywork.toml` instead). Precedence, lowest to highest: defaults, user file,
+(`--project` writes `./mywork.toml` instead, with every setting commented out so it only overrides
+what you uncomment). Precedence, lowest to highest: defaults, user file,
 project file, `MYWORK_*` environment variables, command-line flags.
 
 ```toml

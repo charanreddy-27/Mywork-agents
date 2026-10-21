@@ -50,6 +50,7 @@ from mywork_agents.errors import (
     RefusalError,
     TruncatedOutputError,
 )
+from mywork_agents.models import estimate_cost
 
 if TYPE_CHECKING:
     from mywork_agents.history import HistoryStore
@@ -132,6 +133,8 @@ class Agent(ABC, Generic[OutputT]):
     # Schema sent as ``output_config.format``; None means a free-form text answer.
     output_model: ClassVar[type[BaseModel] | None] = None
     tools: ClassVar[tuple[Tool, ...]] = ()
+    # False when render() returns plain text that must be shown verbatim (commit messages).
+    markdown_output: ClassVar[bool] = True
 
     default_effort: ClassVar[Effort] = "medium"
     default_max_tokens: ClassVar[int] = 32_000
@@ -283,6 +286,7 @@ class Agent(ABC, Generic[OutputT]):
                 turns -= 1
                 continue
 
+            _price(response, resolved.model)
             usage.add(response.usage)
             cited.extend(response.cited_sources)
             searched.extend(response.search_results)
@@ -291,6 +295,8 @@ class Agent(ABC, Generic[OutputT]):
 
             if response.stop_reason == "refusal":
                 raise RefusalError(response.refusal_category)
+            if response.stop_reason == "model_context_window_exceeded":
+                raise TruncatedOutputError(_CONTEXT_FULL)
 
             if response.stop_reason == "pause_turn":
                 pauses += 1
@@ -345,9 +351,12 @@ class Agent(ABC, Generic[OutputT]):
             }
         )
         response = llm.complete(request)
+        _price(response, final.response.model or llm.model)
         usage.add(response.usage)
         if response.stop_reason == "refusal":
             raise RefusalError(response.refusal_category)
+        if response.stop_reason == "model_context_window_exceeded":
+            raise TruncatedOutputError(_CONTEXT_FULL)
         try:
             output = self.finalize(response, final.sources)
         except ValidationError as exc:
@@ -390,6 +399,20 @@ class Agent(ABC, Generic[OutputT]):
                 block["is_error"] = True
             results.append(block)
         return results
+
+
+_CONTEXT_FULL = (
+    "The run filled the model's context window before finishing. "
+    "Narrow the task (fewer files, pages or emails) and try again."
+)
+
+
+def _price(response: LLMResponse, fallback_model: str) -> None:
+    cost = estimate_cost(response.model or fallback_model, response.usage)
+    if cost is None:
+        response.usage.unpriced_requests += 1
+    else:
+        response.usage.cost_usd += cost
 
 
 def _dedupe(sources: list[Source]) -> list[Source]:

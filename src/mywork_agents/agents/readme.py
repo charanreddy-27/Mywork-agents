@@ -26,7 +26,8 @@ missing.
 
 Reply with the README Markdown only: no preamble and no surrounding code fence."""
 
-_FENCED = re.compile(r"^```(?:markdown|md)?\s*\n(.*)\n```\s*$", re.DOTALL)
+# The whole answer wrapped in one outer fence (any fence length).
+_FENCED = re.compile(r"^(`{3,})([A-Za-z]*)[ \t]*\n(.*)\n\1[ \t]*$", re.DOTALL)
 
 
 class ReadmeAgent(Agent[str]):
@@ -53,7 +54,15 @@ class ReadmeAgent(Agent[str]):
     def finalize(self, response: LLMResponse, sources: list[Source]) -> str:
         text = response.text.strip()
         match = _FENCED.match(text)
-        return (match.group(1) if match else text).strip() + "\n"
+        if match:
+            fence, label, inner = match.groups()
+            # A bare fence is only a wrapper if nothing inside could close it; otherwise
+            # the README simply starts and ends with code blocks.
+            if label.lower() in ("markdown", "md") or (
+                not label and not re.search(rf"(?m)^{fence}", inner)
+            ):
+                text = inner
+        return text.strip("\n") + "\n"
 
     def render(self, output: str) -> str:
         return output

@@ -7,7 +7,9 @@ History is what lets agents build on each other: ``standup`` reads yesterday's
 from __future__ import annotations
 
 import json
+import re
 import secrets
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +19,10 @@ from mywork_agents.errors import InputError
 
 if TYPE_CHECKING:
     from mywork_agents.core.agent import RunResult
+
+# Only files with these shapes are runs; anything else under the root is left alone.
+_DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RUN_FILE = re.compile(r"^\d{8}-\d{6}-.+-[0-9a-f]{4}$")
 
 
 @dataclass(frozen=True)
@@ -55,15 +61,17 @@ class HistoryStore:
         self, agent: str | None = None, since: datetime | None = None
     ) -> list[HistoryEntry]:
         """Entries, newest first."""
-        if not self.root.is_dir():
-            return []
         found: list[HistoryEntry] = []
-        for path in self.root.glob("*/*.json"):
+        for path in self._run_files():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("created_at"), str):
+                    continue
                 created = datetime.fromisoformat(data["created_at"])
-            except (OSError, ValueError, KeyError):
+            except (OSError, ValueError, TypeError):
                 continue  # skip unreadable or foreign files rather than failing the listing
+            if created.tzinfo is None:
+                created = created.astimezone()  # treat naive timestamps as local time
             if agent and data.get("agent") != agent:
                 continue
             if since and created < since:
@@ -109,11 +117,25 @@ class HistoryStore:
         return "\n\n".join(sections)
 
     def clear(self) -> int:
+        """Delete run files (and day folders left empty); other files are never touched."""
         removed = 0
-        for path in self.root.glob("*/*.json"):
+        for path in list(self._run_files()):
             path.unlink()
             removed += 1
-        for day_dir in self.root.glob("*"):
-            if day_dir.is_dir() and not any(day_dir.iterdir()):
+        for day_dir in self._day_dirs():
+            if not any(day_dir.iterdir()):
                 day_dir.rmdir()
         return removed
+
+    def _day_dirs(self) -> Iterator[Path]:
+        if not self.root.is_dir():
+            return
+        for day_dir in sorted(self.root.iterdir()):
+            if day_dir.is_dir() and _DAY_DIR.match(day_dir.name):
+                yield day_dir
+
+    def _run_files(self) -> Iterator[Path]:
+        for day_dir in self._day_dirs():
+            for path in sorted(day_dir.glob("*.json")):
+                if path.is_file() and _RUN_FILE.match(path.stem):
+                    yield path

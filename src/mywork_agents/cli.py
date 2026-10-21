@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.status import Status
 from rich.table import Table
@@ -36,7 +37,7 @@ from mywork_agents.agents.inbox import InboxAgent
 from mywork_agents.agents.meeting import MeetingAgent
 from mywork_agents.agents.plan import PlanAgent
 from mywork_agents.agents.readme import ReadmeAgent
-from mywork_agents.agents.research import ResearchAgent
+from mywork_agents.agents.research import DEPTHS, ResearchAgent
 from mywork_agents.agents.review import SEVERITY_RANK, CodeReview, ReviewAgent, worst_severity
 from mywork_agents.agents.standup import StandupAgent, previous_workday_start
 from mywork_agents.config import (
@@ -45,6 +46,7 @@ from mywork_agents.config import (
     Settings,
     config_files,
     load_settings,
+    project_template,
     user_config_path,
 )
 from mywork_agents.core.agent import Agent, AgentContext, RunResult
@@ -62,7 +64,7 @@ from mywork_agents.errors import InputError, MyworkError, RefusalError
 from mywork_agents.history import HistoryEntry, HistoryStore
 from mywork_agents.loaders import ics
 from mywork_agents.loaders.mail import Email, from_text, load_emails
-from mywork_agents.models import estimate_cost, model_info
+from mywork_agents.models import model_info
 from mywork_agents.tools import git
 
 MAX_DIFF_CHARS = 800_000
@@ -267,7 +269,7 @@ class _Progress:
     """Spinner plus a line per tool call, on stderr."""
 
     def __init__(self, title: str) -> None:
-        self.title = title
+        self.title = escape(title)  # plugin agents choose their own titles
         self._status: Status | None = None
 
     def __enter__(self) -> _Progress:
@@ -289,22 +291,27 @@ class _Progress:
             if self._status is not None:
                 label = "thinking…" if event.turn == 1 else f"thinking (turn {event.turn})…"
                 self._status.update(f"[bold]{self.title}[/bold] · {label}")
+        # Everything interpolated below can come from the model: escape it, so text such
+        # as "split\([/\\]" is shown literally instead of being parsed as Rich markup.
         elif isinstance(event, ToolStarted):
-            err.print(f"  [dim]→ {describe_call(event.name, event.input)}[/dim]", highlight=False)
+            call = escape(describe_call(event.name, event.input))
+            err.print(f"  [dim]→ {call}[/dim]", highlight=False)
         elif isinstance(event, ToolFinished) and not event.ok:
-            err.print(f"  [yellow]! {event.name}: {event.summary}[/yellow]", highlight=False)
+            err.print(
+                f"  [yellow]! {escape(event.name)}: {escape(event.summary)}[/yellow]",
+                highlight=False,
+            )
         elif isinstance(event, ServerToolUsed):
             args = event.input if isinstance(event.input, dict) else {}
             if event.name == "web_search" and "query" in args:
-                err.print(f"  [dim]🔎 {args['query']}[/dim]", highlight=False)
+                err.print(f"  [dim]🔎 {escape(str(args['query']))}[/dim]", highlight=False)
             elif event.name == "web_fetch" and "url" in args:
-                err.print(f"  [dim]🌐 {args['url']}[/dim]", highlight=False)
+                err.print(f"  [dim]🌐 {escape(str(args['url']))}[/dim]", highlight=False)
             else:
-                err.print(
-                    f"  [dim]→ {describe_call(event.name, event.input)}[/dim]", highlight=False
-                )
+                call = escape(describe_call(event.name, event.input))
+                err.print(f"  [dim]→ {call}[/dim]", highlight=False)
         elif isinstance(event, Retrying):
-            err.print(f"  [yellow]↻ retrying: {event.reason}[/yellow]", highlight=False)
+            err.print(f"  [yellow]↻ retrying: {escape(event.reason)}[/yellow]", highlight=False)
 
 
 @contextmanager
@@ -317,10 +324,10 @@ def _errors() -> Iterator[None]:
     except typer.Exit:
         raise
     except RefusalError as exc:
-        err.print(f"[red]✗[/red] {exc}")
+        err.print(f"[red]✗[/red] {escape(str(exc))}")
         raise typer.Exit(3) from exc
     except MyworkError as exc:
-        err.print(f"[red]✗[/red] {exc}")
+        err.print(f"[red]✗[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     except anthropic.AuthenticationError as exc:
         err.print(
@@ -328,19 +335,19 @@ def _errors() -> Iterator[None]:
         )
         raise typer.Exit(2) from exc
     except anthropic.PermissionDeniedError as exc:
-        err.print(f"[red]✗[/red] Permission denied by the Claude API: {exc.message}")
+        err.print(f"[red]✗[/red] Permission denied by the Claude API: {escape(exc.message)}")
         raise typer.Exit(2) from exc
     except anthropic.NotFoundError as exc:
-        err.print(f"[red]✗[/red] Not found: {exc.message}. Check the model ID (--model).")
+        err.print(f"[red]✗[/red] Not found: {escape(exc.message)}. Check the model ID (--model).")
         raise typer.Exit(2) from exc
     except anthropic.RateLimitError as exc:
         err.print("[red]✗[/red] Rate limited by the Claude API. Wait a moment and try again.")
         raise typer.Exit(2) from exc
     except anthropic.BadRequestError as exc:
-        err.print(f"[red]✗[/red] The Claude API rejected the request: {exc.message}")
+        err.print(f"[red]✗[/red] The Claude API rejected the request: {escape(exc.message)}")
         raise typer.Exit(2) from exc
     except anthropic.APIStatusError as exc:
-        err.print(f"[red]✗[/red] Claude API error {exc.status_code}: {exc.message}")
+        err.print(f"[red]✗[/red] Claude API error {exc.status_code}: {escape(exc.message)}")
         raise typer.Exit(2) from exc
     except anthropic.APIConnectionError as exc:
         err.print("[red]✗[/red] Could not reach the Claude API. Check your network connection.")
@@ -375,15 +382,19 @@ def _execute(
 
     with progress:
         result = agent.run(agent_ctx, task)
-    entry = (
-        history.save(result, input_preview=input_preview, now=agent_ctx.now) if history else None
-    )
-    _emit(result, opts)
+    # Show the (already paid for) result before anything else can fail.
+    _emit(result, opts, markdown=agent.markdown_output)
+    entry = None
+    if history is not None:
+        try:
+            entry = history.save(result, input_preview=input_preview, now=agent_ctx.now)
+        except OSError as exc:
+            err.print(f"[yellow]Could not save this run to history: {escape(str(exc))}[/yellow]")
     _footer(result, entry)
     return result
 
 
-def _emit(result: RunResult[Any], opts: RunOptions) -> None:
+def _emit(result: RunResult[Any], opts: RunOptions, *, markdown: bool = True) -> None:
     text = (
         json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n"
         if opts.as_json
@@ -392,25 +403,27 @@ def _emit(result: RunResult[Any], opts: RunOptions) -> None:
     if opts.as_json or not out.is_terminal:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         sys.stdout.flush()
-    else:
+    elif markdown:
         out.print(Markdown(result.markdown))
+    else:
+        out.print(Text(result.markdown))  # e.g. a commit message: show the literal text
     if opts.output:
         opts.output.parent.mkdir(parents=True, exist_ok=True)
         opts.output.write_text(text, encoding="utf-8")
-        err.print(f"[green]✓[/green] Saved to {opts.output}")
+        err.print(f"[green]✓[/green] Saved to {escape(str(opts.output))}")
 
 
 def _footer(result: RunResult[Any], entry: HistoryEntry | None) -> None:
     usage = result.usage
     parts = [
-        f"[bold]{result.agent}[/bold]",
-        result.model,
+        f"[bold]{escape(result.agent)}[/bold]",
+        escape(result.model),
         f"{result.turns} turn{'s' if result.turns != 1 else ''}",
         f"{_human_tokens(usage.total_input_tokens)} in / {_human_tokens(usage.output_tokens)} out",
     ]
     if usage.web_search_requests:
         parts.append(f"{usage.web_search_requests} searches")
-    cost = estimate_cost(result.model, usage)
+    cost = usage.estimated_cost
     if cost is not None:
         parts.append(f"≈ ${cost:.3f}")
     parts.append(f"{result.duration_s:.1f}s")
@@ -566,7 +579,9 @@ def standup(
     with _errors():
         settings = _load(ctx, "standup", opts)
         now = _now(settings)
-        since_value = since or f"{previous_workday_start(now.date()):%Y-%m-%d %H:%M}"
+        # Include the offset: git would otherwise read the time in the system time zone.
+        start = previous_workday_start(now.date()).replace(tzinfo=now.tzinfo)
+        since_value = since or f"{start:%Y-%m-%d %H:%M %z}"
 
         commits: dict[str, str] = {}
         for repo in repos or [Path.cwd()]:
@@ -579,7 +594,14 @@ def standup(
                 continue
             root = git.repo_root(repo)
             who = None if author == "all" else author or git.user_email(root)
-            commits[root.name] = git.log(root, since=since_value, author=who, max_count=100)
+            label = root.name
+            if label in commits:  # two repositories with the same folder name
+                label = f"{root.parent.name}/{root.name}"
+            commits[label] = (
+                git.log(root, since=since_value, author=who, max_count=100)
+                if git.has_commits(root)
+                else ""
+            )
 
         notes_source = str(notes) if notes else settings.files.notes
         notes_text = _read_text(notes_source, what="notes") if notes_source else ""
@@ -668,8 +690,9 @@ def research(
         list[str] | None, typer.Option("--url", "-u", help="Page to read first. Repeatable.")
     ] = None,
     depth: Annotated[
-        DepthChoice, typer.Option("--depth", help="quick, standard or deep.")
-    ] = DepthChoice.standard,
+        DepthChoice | None,
+        typer.Option("--depth", help="quick, standard (default) or deep."),
+    ] = None,
     no_search: Annotated[
         bool, typer.Option("--no-search", help="Do not search the web (still reads --url pages).")
     ] = False,
@@ -680,6 +703,9 @@ def research(
     dry_run: DryRunOpt = False,
 ) -> None:
     """Research a question on the web and get a cited brief."""
+    if depth is not None and effort is None:
+        # An explicit --depth beats configured effort; an explicit --effort beats both.
+        effort = EffortChoice(DEPTHS[depth.value][0])
     opts = RunOptions(model, effort, as_json, output, dry_run)
     with _errors():
         settings = _load(ctx, "research", opts)
@@ -688,7 +714,7 @@ def research(
             raise InputError(
                 'Ask a question, e.g. mywork research "best Python task queues in 2026"'
             )
-        agent = ResearchAgent(depth=depth.value, search=not no_search)
+        agent = ResearchAgent(depth=depth.value if depth else "standard", search=not no_search)
         task = agent.build_task(text, urls=urls)
         _execute(agent, task, opts, settings, workspace=Path.cwd(), input_preview=text)
 
@@ -734,20 +760,39 @@ def review(
     with _errors():
         settings = _load(ctx, "review", opts)
         workspace = repo
+        untracked: list[str] = []
         if diff_file:
             diff_text = _read_text(diff_file, what="a diff")
             what = "patch file" if diff_file != "-" else "patch from stdin"
+            if git.is_repo(repo):
+                workspace = git.repo_root(repo)  # patch paths are relative to the repo root
         else:
             if not git.is_repo(repo):
                 raise InputError(
                     f"{repo.resolve()} is not a git repository (use --diff for a patch file)."
                 )
             workspace = git.repo_root(repo)
-            diff_text = git.diff(workspace, staged=staged, base=base, paths=paths or None)
+            # Paths are given relative to where you are, git wants them from the root.
+            prefix = git.run_git(repo, "rev-parse", "--show-prefix").strip()
+            repo_paths = [
+                os.path.relpath(Path(p).resolve(), workspace)
+                if Path(p).is_absolute()
+                else prefix + p
+                for p in paths or []
+            ]
+            diff_text = git.diff(workspace, staged=staged, base=base, paths=repo_paths or None)
+            if not base and not staged:
+                untracked = git.untracked_files(workspace, repo_paths or None)
             what = (
                 f"changes vs {base}"
                 if base
                 else ("staged changes" if staged else "uncommitted changes")
+            )
+        if untracked:
+            names = ", ".join(untracked[:5]) + (" ..." if len(untracked) > 5 else "")
+            err.print(
+                f"[yellow]{len(untracked)} untracked file(s) are not included ({escape(names)}); "
+                "`git add -N <file>` to review them.[/yellow]"
             )
         if not diff_text.strip():
             raise InputError(
@@ -812,7 +857,8 @@ def commit(
             err.print("Not committed.")
             raise typer.Exit(1)
         summary = git.commit(root, message)
-        err.print(f"[green]✓[/green] {summary.splitlines()[0] if summary else 'Committed.'}")
+        first_line = summary.splitlines()[0] if summary else "Committed."
+        err.print(f"[green]✓[/green] {escape(first_line)}")
 
 
 @app.command(rich_help_panel="Development")
@@ -1015,10 +1061,10 @@ def history_list(
             table.add_column(column)
         for entry in entries:
             table.add_row(
-                entry.id,
+                Text(entry.id),
                 f"{entry.created_at:%Y-%m-%d %H:%M}",
-                entry.agent,
-                entry.input_preview.replace("\n", " ")[:60],
+                Text(entry.agent),
+                Text(entry.input_preview.replace("\n", " ")[:60]),
             )
         out.print(table)
 
@@ -1087,7 +1133,7 @@ def config_init(
         err.print(f"[yellow]{target} already exists[/yellow] (use --force to overwrite).")
         raise typer.Exit(1)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+    target.write_text(project_template() if project else CONFIG_TEMPLATE, encoding="utf-8")
     err.print(f"[green]✓[/green] Created {target}")
 
 
@@ -1108,4 +1154,8 @@ def main() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(errors="replace")
+    # Piped input (diffs, transcripts) is UTF-8, whatever the console code page says.
+    reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(encoding="utf-8", errors="replace")
     app()

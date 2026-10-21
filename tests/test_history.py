@@ -59,11 +59,21 @@ def test_recent_markdown_filters_and_truncates(tmp_path: Path) -> None:
     assert "x" * 10 + "\n[... truncated]" in text
 
 
-def test_corrupt_files_are_skipped_and_clear(tmp_path: Path) -> None:
+def test_foreign_files_are_skipped_and_never_deleted(tmp_path: Path) -> None:
     store = HistoryStore(tmp_path)
-    store.save(result("plan", "ok"), input_preview="", now=NOW)
-    (tmp_path / "2026-10-19" / "junk.json").write_text("{not json")
-    assert len(store.entries()) == 1
-    assert store.clear() == 2
+    saved = store.save(result("plan", "ok"), input_preview="", now=NOW)
+    day = tmp_path / "2026-10-19"
+    (day / "junk.json").write_text("{not json")
+    (day / "20261019-080000-plan-abcd.json").write_text('["not", "a", "run"]')
+    naive = day / "20261019-070000-standup-beef.json"
+    naive.write_text('{"id": "naive", "agent": "standup", "created_at": "2026-10-19T07:00:00"}')
+    project = tmp_path / "webapp"
+    project.mkdir()
+    (project / "package.json").write_text("{}")
+
+    ids = [e.id for e in store.entries()]
+    assert ids[0] == saved.id and "naive" in ids  # naive timestamps no longer crash sorting
+    assert store.clear() == 3  # the two run files and the non-dict run-shaped file
+    assert (day / "junk.json").exists()
+    assert (project / "package.json").exists()
     assert store.entries() == []
-    assert not any(tmp_path.iterdir())

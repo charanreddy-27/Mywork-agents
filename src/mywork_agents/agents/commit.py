@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import textwrap
 from typing import Literal
 
@@ -37,23 +38,42 @@ class CommitMessage(BaseModel):
         if self.body and self.body.strip():
             parts.append(_wrap(self.body))
         if self.breaking_change:
-            parts.append(_wrap(f"BREAKING CHANGE: {self.breaking_change}"))
+            footer = f"BREAKING CHANGE: {' '.join(self.breaking_change.split())}"
+            parts.append(textwrap.fill(footer, 72, break_long_words=False, break_on_hyphens=False))
         return "\n\n".join(parts) + "\n"
 
 
+_LIST_ITEM = re.compile(r"\s*([-*+]|\d+[.)])\s")
+_TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: \S")
+
+
 def _wrap(text: str, width: int = 72) -> str:
-    paragraphs = []
-    for paragraph in text.strip().split("\n\n"):
-        lines = paragraph.splitlines()
-        if any(line.lstrip().startswith(("-", "*")) for line in lines):
-            paragraphs.append(
-                "\n".join(
-                    textwrap.fill(line, width, subsequent_indent="  ") for line in lines if line
-                )
+    """Wrap long prose lines without breaking URLs, lists, trailers or indented code."""
+    lines = text.strip().splitlines()
+    # Git only reads trailers (Fixes:, Co-authored-by:) from the final paragraph.
+    last_blank = max((i for i, line in enumerate(lines) if not line.strip()), default=-1)
+    trailers = lines[last_blank + 1 :]
+    trailer_start = (
+        last_blank + 1
+        if trailers and all(_TRAILER.match(line) for line in trailers)
+        else len(lines)
+    )
+    out = []
+    for index, line in enumerate(lines):
+        if not line.strip() or line.startswith((" ", "\t")) or index >= trailer_start:
+            out.append(line.rstrip())  # blank, indented/code, or a git trailer: keep as is
+            continue
+        indent = "  " if _LIST_ITEM.match(line) else ""
+        out.append(
+            textwrap.fill(
+                line,
+                width,
+                subsequent_indent=indent,
+                break_long_words=False,
+                break_on_hyphens=False,
             )
-        else:
-            paragraphs.append(textwrap.fill(" ".join(lines), width))
-    return "\n\n".join(paragraphs)
+        )
+    return "\n".join(out)
 
 
 INSTRUCTIONS = """\
@@ -77,6 +97,7 @@ class CommitAgent(Agent[CommitMessage]):
     group = "Development"
     instructions = INSTRUCTIONS
     output_model = CommitMessage
+    markdown_output = False
     default_effort = "low"
     default_max_tokens = 16_000
 

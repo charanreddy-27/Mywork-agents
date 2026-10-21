@@ -75,16 +75,30 @@ to an older model drops adaptive thinking and effort, and picks basic web search
 ## Security model
 
 - **Read-only tools.** Agents can list, read and search files, and read git history. The only
-  write operations (`commit --apply`, `readme --write`, `-o`) are performed by the CLI on your
-  explicit request, after confirmation.
+  write operations are performed by the CLI on your explicit request: `commit --apply` and
+  `readme --write` ask for confirmation first (unless `--yes`); `-o FILE` writes or overwrites
+  the file you name.
 - **Workspace sandbox.** File paths are resolved and must stay inside the workspace (symlinks
-  included); likely secrets (`.env*`, keys, `credentials.json`, `.npmrc`, ...) are never read.
+  included, both for reading and for listing). Version-control folders (`.git`, `.hg`, `.svn`)
+  are off limits, and likely secrets (`.env*`, `*.env`, `.env*/` folders, keys,
+  `credentials.json`, `.npmrc`, ...) are never read or searched, whether reached by their own
+  name or through a symlink.
+- **Secrets stay out of diffs.** `git_show` cannot print file contents (`rev:path`), is limited to
+  the workspace, and leaves secret files out of patches; the diffs `review` and `commit` send to
+  Claude exclude them too.
 - **No option injection.** Git revisions coming from the model are validated and paths are
   passed after `--`.
-- **SSRF guard.** `fetch_url` only fetches public http(s) URLs and re-checks the final URL after
-  redirects; downloads are capped at 5 MB.
+- **SSRF guard.** `fetch_url` only reaches public addresses. Host names are resolved and vetted
+  at connect time and the vetted address is the one dialled, so numeric host forms, internal
+  DNS names and DNS rebinding cannot reach private, loopback, link-local or shared (100.64/10)
+  ranges. Redirects are followed manually and every hop is checked before it is requested;
+  downloads are capped at 5 MB. (Behind an HTTP proxy, name resolution happens at the proxy, so
+  only literal addresses can be checked.) URLs you type yourself, such as a calendar on your LAN,
+  are not restricted.
 - **Prompt injection.** User-supplied content is wrapped in tags, and the system prompt tells
   Claude to treat it as data and to flag embedded instructions (the bundled
   `examples/emails/03-suspicious.eml` contains one).
 - **Bounded tool output.** Tool results over 30,000 characters are cut with an explicit note
   telling Claude how to page (`offset`/`limit`), never silently.
+- **Untrusted text in the terminal.** Anything that came from the model or your files is
+  escaped before it is printed with Rich, so it is shown literally rather than parsed as markup.
